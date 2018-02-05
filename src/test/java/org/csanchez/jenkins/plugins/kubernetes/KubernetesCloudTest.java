@@ -1,20 +1,28 @@
 package org.csanchez.jenkins.plugins.kubernetes;
 
-import static org.junit.Assert.*;
+import java.util.Arrays;
+import java.util.Collections;
 
+import jenkins.model.JenkinsLocationConfiguration;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.EmptyDirVolume;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.PodVolume;
+import org.junit.After;
+import org.junit.Rule;
 import org.junit.Test;
+import org.jvnet.hudson.test.JenkinsRule;
 
-import com.google.common.collect.ImmutableList;
-
-import java.util.Arrays;
+import static junit.framework.TestCase.assertEquals;
+import static org.junit.Assert.fail;
 
 public class KubernetesCloudTest {
 
-    private KubernetesCloud cloud = new KubernetesCloud("test", null, "http://localhost:8080", "default", null, "", 0,
-            0, /* retentionTimeoutMinutes= */ 5);
+    @Rule
+    public JenkinsRule j = new JenkinsRule();
 
+    @After
+    public void tearDown() {
+        System.getProperties().remove("KUBERNETES_JENKINS_URL");
+    }
 
     @Test
     public void testInheritance() {
@@ -31,33 +39,42 @@ public class KubernetesCloudTest {
         parent.setContainers(Arrays.asList(jnlp));
         parent.setVolumes(Arrays.asList(podVolume));
 
-
         ContainerTemplate maven2 = new ContainerTemplate("maven", "maven:2");
         PodTemplate withNewMavenVersion = new PodTemplate();
         withNewMavenVersion.setContainers(Arrays.asList(maven2));
 
         PodTemplate result = PodTemplateUtils.combine(parent, withNewMavenVersion);
+    }
 
-
+    @Test(expected = IllegalStateException.class)
+    public void getJenkinsUrlOrDie_NoJenkinsUrl() {
+        JenkinsLocationConfiguration.get().setUrl(null);
+        KubernetesCloud cloud = new KubernetesCloud("name");
+        String url = cloud.getJenkinsUrlOrDie();
+        fail("Should have thrown IllegalStateException at this point but got " + url + " instead.");
     }
 
     @Test
-    public void testParseDockerCommand() {
-        assertNull(cloud.parseDockerCommand(""));
-        assertNull(cloud.parseDockerCommand(null));
-        assertEquals(ImmutableList.of("bash"), cloud.parseDockerCommand("bash"));
-        assertEquals(ImmutableList.of("bash", "-c", "x y"), cloud.parseDockerCommand("bash -c \"x y\""));
-        assertEquals(ImmutableList.of("a", "b", "c", "d"), cloud.parseDockerCommand("a b c d"));
+    public void getJenkinsUrlOrDie_UrlInCloud() {
+        System.setProperty("KUBERNETES_JENKINS_URL", "http://mylocationinsysprop");
+        KubernetesCloud cloud = new KubernetesCloud("name");
+        cloud.setJenkinsUrl("http://mylocation");
+        assertEquals("http://mylocation/", cloud.getJenkinsUrlOrDie());
     }
 
     @Test
-    public void testParseLivenessProbe() {
-        assertNull(cloud.parseLivenessProbe(""));
-        assertNull(cloud.parseLivenessProbe(null));
-        assertEquals(ImmutableList.of("docker","info"), cloud.parseLivenessProbe("docker info"));
-        assertEquals(ImmutableList.of("echo","I said: 'I am alive'"), cloud.parseLivenessProbe("echo \"I said: 'I am alive'\""));
-        assertEquals(ImmutableList.of("docker","--version"), cloud.parseLivenessProbe("docker --version"));
-        assertEquals(ImmutableList.of("curl","-k","--silent","--output=/dev/null","https://localhost:8080"), cloud.parseLivenessProbe("curl -k --silent --output=/dev/null \"https://localhost:8080\""));
+    public void getJenkinsUrlOrDie_UrlInSysprop() {
+        System.setProperty("KUBERNETES_JENKINS_URL", "http://mylocation");
+        KubernetesCloud cloud = new KubernetesCloud("name");
+        assertEquals("http://mylocation/", cloud.getJenkinsUrlOrDie());
     }
+
+    @Test
+    public void getJenkinsUrlOrDie_UrlInLocation() {
+        JenkinsLocationConfiguration.get().setUrl("http://mylocation");
+        KubernetesCloud cloud = new KubernetesCloud("name");
+        assertEquals("http://mylocation/", cloud.getJenkinsUrlOrDie());
+    }
+
 
 }

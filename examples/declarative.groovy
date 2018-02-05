@@ -1,7 +1,7 @@
 pipeline {
   agent {
     kubernetes {
-      //cloud 'kubernetes-plugin-test'
+      //cloud 'kubernetes'
       label 'mypod'
       containerTemplate {
         name 'maven'
@@ -14,7 +14,9 @@ pipeline {
   stages {
     stage('Run maven') {
       steps {
-        sh 'mvn -version'
+        container('maven') {
+          sh 'mvn -version'
+        }
       }
     }
   }

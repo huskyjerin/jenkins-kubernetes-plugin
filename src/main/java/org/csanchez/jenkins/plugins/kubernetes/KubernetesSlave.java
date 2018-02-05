@@ -1,17 +1,27 @@
 package org.csanchez.jenkins.plugins.kubernetes;
 
 import java.io.IOException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateEncodingException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import javax.annotation.Nonnull;
+
 import org.apache.commons.lang.RandomStringUtils;
 import org.apache.commons.lang.StringUtils;
+import org.jenkinsci.plugins.durabletask.executors.Messages;
 import org.jenkinsci.plugins.durabletask.executors.OnceRetentionStrategy;
 import org.jvnet.localizer.Localizable;
 import org.jvnet.localizer.ResourceBundleHolder;
 import org.kohsuke.stapler.DataBoundConstructor;
 
 import hudson.Extension;
+import hudson.Util;
 import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.Label;
@@ -19,13 +29,10 @@ import hudson.model.Node;
 import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.Cloud;
-import hudson.slaves.JNLPLauncher;
 import hudson.slaves.OfflineCause;
 import hudson.slaves.RetentionStrategy;
-import io.fabric8.kubernetes.api.model.DoneablePod;
-import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.dsl.PodResource;
+import io.fabric8.kubernetes.client.KubernetesClientException;
 import jenkins.model.Jenkins;
 
 /**
@@ -35,29 +42,47 @@ public class KubernetesSlave extends AbstractCloudSlave {
 
     private static final Logger LOGGER = Logger.getLogger(KubernetesSlave.class.getName());
 
+    private static final Integer DISCONNECTION_TIMEOUT = Integer
+            .getInteger(KubernetesSlave.class.getName() + ".disconnectionTimeout", 5);
+
     private static final long serialVersionUID = -8642936855413034232L;
     private static final String DEFAULT_AGENT_PREFIX = "jenkins-agent";
 
     /**
      * The resource bundle reference
      */
-    private final static ResourceBundleHolder HOLDER = ResourceBundleHolder.get(Messages.class);
+    private static final ResourceBundleHolder HOLDER = ResourceBundleHolder.get(Messages.class);
 
     private final String cloudName;
     private final String namespace;
+    private final PodTemplate template;
 
+    public PodTemplate getTemplate() {
+        return template;
+    }
+
+    /**
+     * @deprecated Use {@link #KubernetesSlave(PodTemplate, String, String, String, RetentionStrategy)} instead.
+     */
+    @Deprecated
     public KubernetesSlave(PodTemplate template, String nodeDescription, KubernetesCloud cloud, String labelStr)
             throws Descriptor.FormException, IOException {
 
-        this(template, nodeDescription, cloud, labelStr, new OnceRetentionStrategy(cloud.getRetentionTimeout()));
+        this(template, nodeDescription, cloud.name, labelStr, new OnceRetentionStrategy(cloud.getRetentionTimeout()));
     }
 
+    /**
+     * @deprecated Use {@link #KubernetesSlave(PodTemplate, String, String, String, RetentionStrategy)} instead.
+     */
     @Deprecated
     public KubernetesSlave(PodTemplate template, String nodeDescription, KubernetesCloud cloud, Label label)
             throws Descriptor.FormException, IOException {
-        this(template, nodeDescription, cloud, label.toString(), new OnceRetentionStrategy(cloud.getRetentionTimeout())) ;
+        this(template, nodeDescription, cloud.name, label.toString(), new OnceRetentionStrategy(cloud.getRetentionTimeout())) ;
     }
 
+    /**
+     * @deprecated Use {@link #KubernetesSlave(PodTemplate, String, String, String, RetentionStrategy)} instead.
+     */
     @Deprecated
     public KubernetesSlave(PodTemplate template, String nodeDescription, KubernetesCloud cloud, String labelStr,
                            RetentionStrategy rs)
@@ -76,13 +101,13 @@ public class KubernetesSlave extends AbstractCloudSlave {
                 1,
                 template.getNodeUsageMode() != null ? template.getNodeUsageMode() : Node.Mode.NORMAL,
                 labelStr == null ? null : labelStr,
-                new JNLPLauncher(),
+                new KubernetesLauncher(),
                 rs,
                 template.getNodeProperties());
 
-        // this.pod = pod;
         this.cloudName = cloudName;
-        this.namespace = template.getNamespace();
+        this.namespace = Util.fixEmpty(template.getNamespace());
+        this.template = template;
     }
 
     public String getCloudName() {
@@ -93,8 +118,28 @@ public class KubernetesSlave extends AbstractCloudSlave {
         return namespace;
     }
 
+    /**
+
+     * @deprecated Please use the strongly typed getKubernetesCloud() instead.
+     */
+    @Deprecated
     public Cloud getCloud() {
         return Jenkins.getInstance().getCloud(getCloudName());
+    }
+
+    /**
+     * Returns the cloud instance which created this agent.
+     * @return the cloud instance which created this agent.
+     * @throws IllegalStateException if the cloud doesn't exist anymore, or is not a {@link KubernetesCloud}.
+     */
+    @Nonnull
+    public KubernetesCloud getKubernetesCloud() {
+        Cloud cloud = Jenkins.getInstance().getCloud(getCloudName());
+        if (cloud instanceof KubernetesCloud) {
+            return (KubernetesCloud) cloud;
+        } else {
+            throw new IllegalStateException(getClass().getName() + " can be launched only by instances of " + KubernetesCloud.class.getName());
+        }
     }
 
     static String getSlaveName(PodTemplate template) {
@@ -117,49 +162,72 @@ public class KubernetesSlave extends AbstractCloudSlave {
 
     @Override
     protected void _terminate(TaskListener listener) throws IOException, InterruptedException {
-        LOGGER.log(Level.INFO, "Terminating Kubernetes instance for slave {0}", name);
+        LOGGER.log(Level.INFO, "Terminating Kubernetes instance for agent {0}", name);
 
         Computer computer = toComputer();
         if (computer == null) {
-            String msg = String.format("Computer for slave is null: %s", name);
+            String msg = String.format("Computer for agent is null: %s", name);
             LOGGER.log(Level.SEVERE, msg);
             listener.fatalError(msg);
             return;
+        }
+
+        OfflineCause offlineCause = OfflineCause.create(new Localizable(HOLDER, "offline"));
+
+        Future<?> disconnected = computer.disconnect(offlineCause);
+        // wait a bit for disconnection to avoid stack traces in logs
+        try {
+            disconnected.get(DISCONNECTION_TIMEOUT, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            String msg = String.format("Ignoring error waiting for agent disconnection %s: %s", name, e.getMessage());
+            LOGGER.log(Level.INFO, msg, e);
         }
 
         if (getCloudName() == null) {
-            String msg = String.format("Cloud name is not set for slave, can't terminate: %s", name);
+            String msg = String.format("Cloud name is not set for agent, can't terminate: %s", name);
             LOGGER.log(Level.SEVERE, msg);
             listener.fatalError(msg);
             return;
         }
-
+        KubernetesCloud cloud;
         try {
-            Cloud cloud = getCloud();
-            if (cloud == null) {
-                String msg = String.format("Slave cloud no longer exists: %s", getCloudName());
-                LOGGER.log(Level.WARNING, msg);
-                listener.fatalError(msg);
-                return;
-            }
-            if (!(cloud instanceof KubernetesCloud)) {
-                String msg = String.format("Slave cloud is not a KubernetesCloud, something is very wrong: %s",
-                        getCloudName());
-                LOGGER.log(Level.SEVERE, msg);
-                listener.fatalError(msg);
-                return;
-            }
-            KubernetesClient client = ((KubernetesCloud) cloud).connect();
-            PodResource<Pod, DoneablePod> pods = client.pods().inNamespace(namespace).withName(name);
-            pods.delete();
-            String msg = String.format("Terminated Kubernetes instance for slave %s", name);
-            LOGGER.log(Level.INFO, msg);
-            listener.getLogger().println(msg);
-            computer.disconnect(OfflineCause.create(new Localizable(HOLDER, "offline")));
-            LOGGER.log(Level.INFO, "Disconnected computer {0}", name);
-        } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to terminate pod for slave " + name, e);
+            cloud = getKubernetesCloud();
+        } catch (IllegalStateException e) {
+            e.printStackTrace(listener.fatalError("Unable to terminate agent. Cloud may have been removed. There may be leftover resources on the Kubernetes cluster."));
+            LOGGER.log(Level.SEVERE, String.format("Unable to terminate agent %s. Cloud may have been removed. There may be leftover resources on the Kubernetes cluster.", name));
+            return;
         }
+        KubernetesClient client;
+        try {
+            client = cloud.connect();
+        } catch (UnrecoverableKeyException | CertificateEncodingException | NoSuchAlgorithmException
+                | KeyStoreException e) {
+            String msg = String.format("Failed to connect to cloud %s", getCloudName());
+            e.printStackTrace(listener.fatalError(msg));
+            return;
+        }
+
+        String actualNamespace = getNamespace() == null ? client.getNamespace() : getNamespace();
+        try {
+            Boolean deleted = client.pods().inNamespace(actualNamespace).withName(name).delete();
+            if (!Boolean.TRUE.equals(deleted)) {
+                String msg = String.format("Failed to delete pod for agent %s/%s: not found", actualNamespace, name);
+                LOGGER.log(Level.WARNING, msg);
+                listener.error(msg);
+                return;
+            }
+        } catch (KubernetesClientException e) {
+            String msg = String.format("Failed to delete pod for agent %s/%s: %s", actualNamespace, name,
+                    e.getMessage());
+            LOGGER.log(Level.WARNING, msg, e);
+            listener.error(msg);
+            return;
+        }
+
+        String msg = String.format("Terminated Kubernetes instance for agent %s/%s", actualNamespace, name);
+        LOGGER.log(Level.INFO, msg);
+        listener.getLogger().println(msg);
+        LOGGER.log(Level.INFO, "Disconnected computer {0}", name);
     }
 
     @Override
@@ -167,13 +235,35 @@ public class KubernetesSlave extends AbstractCloudSlave {
         return String.format("KubernetesSlave name: %s", name);
     }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        if (!super.equals(o)) return false;
+
+        KubernetesSlave that = (KubernetesSlave) o;
+
+        if (cloudName != null ? !cloudName.equals(that.cloudName) : that.cloudName != null) return false;
+        if (namespace != null ? !namespace.equals(that.namespace) : that.namespace != null) return false;
+        return template != null ? template.equals(that.template) : that.template == null;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = super.hashCode();
+        result = 31 * result + (cloudName != null ? cloudName.hashCode() : 0);
+        result = 31 * result + (namespace != null ? namespace.hashCode() : 0);
+        result = 31 * result + (template != null ? template.hashCode() : 0);
+        return result;
+    }
+
     @Extension
     public static final class DescriptorImpl extends SlaveDescriptor {
 
         @Override
         public String getDisplayName() {
-            return "Kubernetes Slave";
-        };
+            return "Kubernetes Agent";
+        }
 
         @Override
         public boolean isInstantiable() {

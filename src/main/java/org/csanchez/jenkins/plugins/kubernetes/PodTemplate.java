@@ -1,7 +1,5 @@
 package org.csanchez.jenkins.plugins.kubernetes;
 
-import hudson.tools.ToolLocationNodeProperty;
-
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -14,10 +12,12 @@ import java.util.logging.Logger;
 import javax.annotation.Nonnull;
 
 import org.apache.commons.lang.StringUtils;
+import org.csanchez.jenkins.plugins.kubernetes.model.TemplateEnvVar;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.PodVolume;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.workspace.WorkspaceVolume;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 
@@ -27,9 +27,13 @@ import hudson.Extension;
 import hudson.Util;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
+import hudson.model.DescriptorVisibilityFilter;
 import hudson.model.Label;
-import hudson.model.labels.LabelAtom;
 import hudson.model.Node;
+import hudson.model.labels.LabelAtom;
+import hudson.tools.ToolLocationNodeProperty;
+import io.fabric8.kubernetes.api.model.Pod;
+import jenkins.model.Jenkins;
 
 /**
  * Kubernetes Pod Template
@@ -44,7 +48,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
 
     private static final Logger LOGGER = Logger.getLogger(PodTemplate.class.getName());
 
-    private static final int DEFAULT_SLAVE_JENKINS_CONNECTION_TIMEOUT = 100;
+    public static final int DEFAULT_SLAVE_JENKINS_CONNECTION_TIMEOUT = 100;
 
     private String inheritFrom;
 
@@ -70,6 +74,8 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
 
     private int idleMinutes;
 
+    private int activeDeadlineSeconds;
+
     private String label;
 
     private String serviceAccount;
@@ -93,11 +99,11 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
 
     private List<ContainerTemplate> containers = new ArrayList<ContainerTemplate>();
 
-    private final List<PodEnvVar> envVars = new ArrayList<PodEnvVar>();
+    private List<TemplateEnvVar> envVars = new ArrayList<>();
 
     private List<PodAnnotation> annotations = new ArrayList<PodAnnotation>();
 
-    private final List<PodImagePullSecret> imagePullSecrets = new ArrayList<PodImagePullSecret>();
+    private List<PodImagePullSecret> imagePullSecrets = new ArrayList<PodImagePullSecret>();
 
     private transient List<ToolLocationNodeProperty> nodeProperties;
 
@@ -118,6 +124,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         this.setNodeUsageMode(from.getNodeUsageMode());
         this.setServiceAccount(from.getServiceAccount());
         this.setSlaveConnectTimeout(from.getSlaveConnectTimeout());
+        this.setActiveDeadlineSeconds(from.getActiveDeadlineSeconds());
         this.setVolumes(from.getVolumes());
         this.setWorkspaceVolume(from.getWorkspaceVolume());
     }
@@ -135,7 +142,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         }
     }
 
-    @Restricted(DoNotUse.class) // testing only
+    @Restricted(NoExternalUse.class) // testing only
     PodTemplate(String name, List<? extends PodVolume> volumes, List<? extends ContainerTemplate> containers) {
         this.name = name;
         this.volumes.addAll(volumes);
@@ -216,7 +223,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
     }
 
     public void setInstanceCap(int instanceCap) {
-        if (instanceCap <= 0) {
+        if (instanceCap < 0) {
             this.instanceCap = Integer.MAX_VALUE;
         } else {
             this.instanceCap = instanceCap;
@@ -229,7 +236,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
 
     public void setSlaveConnectTimeout(int slaveConnectTimeout) {
         if (slaveConnectTimeout <= 0) {
-            LOGGER.log(Level.WARNING, "Slave -> Jenkins connection timeout " +
+            LOGGER.log(Level.WARNING, "Agent -> Jenkins connection timeout " +
                     "cannot be <= 0. Falling back to the default value: " +
                     DEFAULT_SLAVE_JENKINS_CONNECTION_TIMEOUT);
             this.slaveConnectTimeout = DEFAULT_SLAVE_JENKINS_CONNECTION_TIMEOUT;
@@ -282,6 +289,14 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         return idleMinutes;
     }
 
+    public void setActiveDeadlineSeconds(int i) {
+        this.activeDeadlineSeconds = i;
+    }
+
+    public int getActiveDeadlineSeconds() {
+        return activeDeadlineSeconds;
+    }
+
     @DataBoundSetter
     public void setIdleMinutesStr(String idleMinutes) {
         if (StringUtils.isBlank(idleMinutes)) {
@@ -296,6 +311,23 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
             return "";
         } else {
             return String.valueOf(idleMinutes);
+        }
+    }
+
+    @DataBoundSetter
+    public void setActiveDeadlineSecondsStr(String activeDeadlineSeconds) {
+        if (StringUtils.isBlank(activeDeadlineSeconds)) {
+            setActiveDeadlineSeconds(0);
+        } else {
+            setActiveDeadlineSeconds(Integer.parseInt(activeDeadlineSeconds));
+        }
+    }
+
+    public String getActiveDeadlineSecondsStr() {
+        if (getActiveDeadlineSeconds() == 0) {
+            return "";
+        } else {
+            return String.valueOf(activeDeadlineSeconds);
         }
     }
 
@@ -366,22 +398,21 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         return getFirstContainer().map(ContainerTemplate::isAlwaysPullImage).orElse(false);
     }
 
-    public List<PodEnvVar> getEnvVars() {
+    public List<TemplateEnvVar> getEnvVars() {
         if (envVars == null) {
             return Collections.emptyList();
         }
         return envVars;
     }
 
-    @DataBoundSetter
-    public void addEnvVars(List<PodEnvVar> envVars) {
+    public void addEnvVars(List<TemplateEnvVar> envVars) {
         if (envVars != null) {
             this.envVars.addAll(envVars);
         }
     }
 
     @DataBoundSetter
-    public void setEnvVars(List<PodEnvVar> envVars) {
+    public void setEnvVars(List<TemplateEnvVar> envVars) {
         if (envVars != null) {
             this.envVars.clear();
             this.addEnvVars(envVars);
@@ -395,7 +426,6 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         return annotations;
     }
 
-    @DataBoundSetter
     public void addAnnotations(List<PodAnnotation> annotations) {
         this.annotations.addAll(annotations);
     }
@@ -409,22 +439,17 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         }
     }
 
-
     public List<PodImagePullSecret> getImagePullSecrets() {
-        if (imagePullSecrets == null) {
-            return Collections.emptyList();
-        }
-        return imagePullSecrets;
+        return imagePullSecrets == null ? Collections.emptyList() : imagePullSecrets;
     }
 
-    @DataBoundSetter
     public void addImagePullSecrets(List<PodImagePullSecret> imagePullSecrets) {
         this.imagePullSecrets.addAll(imagePullSecrets);
     }
 
-        @DataBoundSetter
+    @DataBoundSetter
     public void setImagePullSecrets(List<PodImagePullSecret> imagePullSecrets) {
-        if(imagePullSecrets != null) {
+        if (imagePullSecrets != null) {
             this.imagePullSecrets.clear();
             this.addImagePullSecrets(imagePullSecrets);
         }
@@ -541,13 +566,13 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
     protected Object readResolve() {
         if (containers == null) {
             // upgrading from 0.8
-            containers = new ArrayList<ContainerTemplate>();
+            containers = new ArrayList<>();
             ContainerTemplate containerTemplate = new ContainerTemplate(KubernetesCloud.JNLP_NAME, this.image);
             containerTemplate.setCommand(command);
             containerTemplate.setArgs(Strings.isNullOrEmpty(args) ? FALLBACK_ARGUMENTS : args);
             containerTemplate.setPrivileged(privileged);
             containerTemplate.setAlwaysPullImage(alwaysPullImage);
-            containerTemplate.setEnvVars(PodEnvVar.asContainerEnvVar(envVars));
+            containerTemplate.setEnvVars(envVars);
             containerTemplate.setResourceRequestMemory(resourceRequestMemory);
             containerTemplate.setResourceLimitCpu(resourceLimitCpu);
             containerTemplate.setResourceLimitMemory(resourceLimitMemory);
@@ -563,6 +588,15 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         return this;
     }
 
+    /**
+     * Build a Pod object from a PodTemplate
+     * 
+     * @param slave
+     */
+    public Pod build(KubernetesSlave slave) {
+        return new PodTemplateBuilder(this).build(slave);
+    }
+
     @Extension
     public static class DescriptorImpl extends Descriptor<PodTemplate> {
 
@@ -570,5 +604,46 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         public String getDisplayName() {
             return "Kubernetes Pod Template";
         }
+
+        @SuppressWarnings("unused") // Used by jelly
+        @Restricted(DoNotUse.class) // Used by jelly
+        public List<? extends Descriptor> getEnvVarsDescriptors() {
+            return DescriptorVisibilityFilter.apply(null, Jenkins.getInstance().getDescriptorList(TemplateEnvVar.class));
+        }
+    }
+
+    @Override
+    public String toString() {
+        return "PodTemplate{" +
+                (inheritFrom == null ? "" : "inheritFrom='" + inheritFrom + '\'') +
+                (name == null ? "" : ", name='" + name + '\'') +
+                (namespace == null ? "" : ", namespace='" + namespace + '\'') +
+                (image == null ? "" : ", image='" + image + '\'') +
+                (!privileged ? "" : ", privileged=" + privileged) +
+                (!alwaysPullImage ? "" : ", alwaysPullImage=" + alwaysPullImage) +
+                (command == null ? "" : ", command='" + command + '\'') +
+                (args == null ? "" : ", args='" + args + '\'') +
+                (remoteFs == null ? "" : ", remoteFs='" + remoteFs + '\'') +
+                (instanceCap == Integer.MAX_VALUE ? "" : ", instanceCap=" + instanceCap) +
+                (slaveConnectTimeout == DEFAULT_SLAVE_JENKINS_CONNECTION_TIMEOUT ? "" : ", slaveConnectTimeout=" + slaveConnectTimeout) +
+                (idleMinutes == 0 ? "" : ", idleMinutes=" + idleMinutes) +
+                (activeDeadlineSeconds == 0 ? "" : ", activeDeadlineSeconds=" + activeDeadlineSeconds) +
+                (label == null ? "" : ", label='" + label + '\'') +
+                (serviceAccount == null ? "" : ", serviceAccount='" + serviceAccount + '\'') +
+                (nodeSelector == null ? "" : ", nodeSelector='" + nodeSelector + '\'') +
+                (nodeUsageMode == null ? "" : ", nodeUsageMode=" + nodeUsageMode) +
+                (resourceRequestCpu == null ? "" : ", resourceRequestCpu='" + resourceRequestCpu + '\'') +
+                (resourceRequestMemory == null ? "" : ", resourceRequestMemory='" + resourceRequestMemory + '\'') +
+                (resourceLimitCpu == null ? "" : ", resourceLimitCpu='" + resourceLimitCpu + '\'') +
+                (resourceLimitMemory == null ? "" : ", resourceLimitMemory='" + resourceLimitMemory + '\'') +
+                (!customWorkspaceVolumeEnabled ? "" : ", customWorkspaceVolumeEnabled=" + customWorkspaceVolumeEnabled) +
+                (workspaceVolume == null ? "" : ", workspaceVolume=" + workspaceVolume) +
+                (volumes == null || volumes.isEmpty() ? "" : ", volumes=" + volumes) +
+                (containers == null || containers.isEmpty() ? "" : ", containers=" + containers) +
+                (envVars == null || envVars.isEmpty() ? "" : ", envVars=" + envVars) +
+                (annotations == null || annotations.isEmpty() ? "" : ", annotations=" + annotations) +
+                (imagePullSecrets == null || imagePullSecrets.isEmpty() ? "" : ", imagePullSecrets=" + imagePullSecrets) +
+                (nodeProperties == null || nodeProperties.isEmpty() ? "" : ", nodeProperties=" + nodeProperties) +
+                '}';
     }
 }

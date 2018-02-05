@@ -1,36 +1,56 @@
 package org.csanchez.jenkins.plugins.kubernetes.pipeline;
 
+import static org.csanchez.jenkins.plugins.kubernetes.pipeline.Resources.*;
+
 import java.io.Closeable;
-import java.io.IOException;
+import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
-import org.csanchez.jenkins.plugins.kubernetes.KubernetesSlave;
-import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
+import javax.annotation.Nonnull;
+
 import org.jenkinsci.plugins.workflow.steps.BodyExecutionCallback;
 import org.jenkinsci.plugins.workflow.steps.BodyInvoker;
+import org.jenkinsci.plugins.workflow.steps.EnvironmentExpander;
 import org.jenkinsci.plugins.workflow.steps.StepContext;
+import org.jenkinsci.plugins.workflow.steps.StepExecution;
 
-import hudson.AbortException;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import hudson.EnvVars;
 import hudson.FilePath;
 import hudson.LauncherDecorator;
-import hudson.model.Node;
-import hudson.model.TaskListener;
-import io.fabric8.kubernetes.client.Config;
+import hudson.slaves.EnvironmentVariablesNodeProperty;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.NodePropertyDescriptor;
+import hudson.util.DescribableList;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import jenkins.model.Jenkins;
 
-public class ContainerStepExecution extends AbstractStepExecutionImpl {
+public class ContainerStepExecution extends StepExecution {
 
     private static final long serialVersionUID = 7634132798345235774L;
 
     private static final transient Logger LOGGER = Logger.getLogger(ContainerStepExecution.class.getName());
-    private static final transient String HOSTNAME_FILE = "/etc/hostname";
 
-    private final ContainerStep step;
+    @SuppressFBWarnings(value = "SE_TRANSIENT_FIELD_NOT_RESTORED", justification = "not needed on deserialization")
+    private final transient ContainerStep step;
 
     private transient KubernetesClient client;
-    private transient ContainerExecDecorator decorator;
+    private ContainerExecDecorator decorator;
+
+    @Override
+    // TODO Revisit for JENKINS-40161
+    public void onResume() {
+        super.onResume();
+        LOGGER.log(Level.FINE, "onResume");
+        try {
+            KubernetesNodeContext nodeContext = new KubernetesNodeContext(getContext());
+            client = nodeContext.connectToCloud();
+            decorator.setKubernetesClient(client);
+        } catch (Exception e) {
+            ContainerStepExecution.this.getContext().onFailure(e);
+        }
+    }
 
     ContainerStepExecution(ContainerStep step, StepContext context) {
         super(context);
@@ -40,24 +60,29 @@ public class ContainerStepExecution extends AbstractStepExecutionImpl {
     @Override
     public boolean start() throws Exception {
         LOGGER.log(Level.FINE, "Starting container step.");
-        FilePath workspace = getContext().get(FilePath.class);
-        String podName = workspace.child(HOSTNAME_FILE).readToString().trim();
-        String namespace = workspace.child(Config.KUBERNETES_NAMESPACE_PATH).readToString().trim();
-
         String containerName = step.getName();
 
-        Node node = getContext().get(Node.class);
-        if (! (node instanceof KubernetesSlave)) {
-            throw new AbortException(String.format("Node is not a Kubernetes node: %s", node.getNodeName()));
-        }
-        KubernetesSlave slave = (KubernetesSlave) node;
-        KubernetesCloud cloud = (KubernetesCloud) slave.getCloud();
-        if (cloud == null) {
-            throw new AbortException(String.format("Cloud does not exist: %s", slave.getCloudName()));
-        }
-        client = cloud.connect();
+        KubernetesNodeContext nodeContext = new KubernetesNodeContext(getContext());
+        client = nodeContext.connectToCloud();
 
-        decorator = new ContainerExecDecorator(client, podName,  containerName, namespace);
+        EnvironmentExpander env = getContext().get(EnvironmentExpander.class);
+        EnvVars globalVars = null;
+        Jenkins instance = Jenkins.getInstance();
+        DescribableList<NodeProperty<?>, NodePropertyDescriptor> globalNodeProperties = instance
+                .getGlobalNodeProperties();
+        List<EnvironmentVariablesNodeProperty> envVarsNodePropertyList = globalNodeProperties
+                .getAll(EnvironmentVariablesNodeProperty.class);
+        if (envVarsNodePropertyList != null && envVarsNodePropertyList.size() != 0) {
+            globalVars = envVarsNodePropertyList.get(0).getEnvVars();
+        }
+        decorator = new ContainerExecDecorator();
+        decorator.setClient(client);
+        decorator.setPodName(nodeContext.getPodName());
+        decorator.setContainerName(containerName);
+        decorator.setNamespace(nodeContext.getNamespace());
+        decorator.setEnvironmentExpander(env);
+        decorator.setWs(getContext().get(FilePath.class));
+        decorator.setGlobalVars(globalVars);
         getContext().newBodyInvoker()
                 .withContext(BodyInvoker
                         .mergeLauncherDecorators(getContext().get(LauncherDecorator.class), decorator))
@@ -67,16 +92,12 @@ public class ContainerStepExecution extends AbstractStepExecutionImpl {
     }
 
     @Override
-    public void stop(Throwable cause) throws Exception {
+    public void stop(@Nonnull Throwable cause) throws Exception {
         LOGGER.log(Level.FINE, "Stopping container step.");
-        closeQuietly(client, decorator);
+        closeQuietly(getContext(), client, decorator);
     }
 
-    private void closeQuietly(Closeable... closeables) {
-        closeQuietly(getContext(), closeables);
-    }
-
-    private static class ContainerExecCallback extends BodyExecutionCallback {
+    private static class ContainerExecCallback extends BodyExecutionCallback.TailCall {
 
         private static final long serialVersionUID = 6385838254761750483L;
 
@@ -85,34 +106,10 @@ public class ContainerStepExecution extends AbstractStepExecutionImpl {
         private ContainerExecCallback(Closeable... closeables) {
             this.closeables = closeables;
         }
-
         @Override
-        public void onSuccess(StepContext context, Object result) {
-            context.onSuccess(result);
-            closeQuietly(context, closeables);
-
-        }
-
-        @Override
-        public void onFailure(StepContext context, Throwable t) {
-            context.onFailure(t);
+        public void finished(StepContext context) {
             closeQuietly(context, closeables);
         }
     }
 
-    private static void closeQuietly(StepContext context, Closeable... closeables) {
-        for (Closeable c : closeables) {
-            if (c != null) {
-                try {
-                    c.close();
-                } catch (IOException e) {
-                    try {
-                        context.get(TaskListener.class).error("Error while closing: [" + c + "]");
-                    } catch (IOException | InterruptedException e1) {
-                        LOGGER.log(Level.WARNING, "Error writing to task listener", e);
-                    }
-                }
-            }
-        }
-    }
 }

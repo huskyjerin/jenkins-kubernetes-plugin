@@ -1,7 +1,6 @@
 pipeline {
   agent {
     kubernetes {
-      cloud 'kubernetes-plugin-test'
       label 'mypod'
       containerTemplate {
         name 'maven'
@@ -11,10 +10,18 @@ pipeline {
       }
     }
   }
+  environment {
+    CONTAINER_ENV_VAR = 'container-env-var-value'
+  }
   stages {
     stage('Run maven') {
       steps {
-        sh 'mvn -version'
+        sh 'set'
+        sh "echo OUTSIDE_CONTAINER_ENV_VAR = ${CONTAINER_ENV_VAR}"
+        container('maven') {
+          sh 'echo INSIDE_CONTAINER_ENV_VAR = ${CONTAINER_ENV_VAR}'
+          sh 'mvn -version'
+        }
       }
     }
   }

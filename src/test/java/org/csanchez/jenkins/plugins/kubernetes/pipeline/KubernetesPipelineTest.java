@@ -27,92 +27,60 @@ package org.csanchez.jenkins.plugins.kubernetes.pipeline;
 import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.*;
 import static org.junit.Assert.*;
 
-import java.net.InetAddress;
-import java.net.URL;
-import java.util.Collections;
+import java.util.List;
 import java.util.logging.Level;
+import java.util.logging.Logger;
 
-import org.apache.commons.compress.utils.IOUtils;
-import org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate;
-import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
 import org.csanchez.jenkins.plugins.kubernetes.PodTemplate;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
-import org.jenkinsci.plugins.workflow.test.steps.SemaphoreStep;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runners.model.Statement;
-import org.jvnet.hudson.test.BuildWatcher;
-import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.JenkinsRuleNonLocalhost;
-import org.jvnet.hudson.test.LoggerRule;
-import org.jvnet.hudson.test.RestartableJenkinsRule;
 
-import hudson.model.Node;
-import hudson.slaves.DumbSlave;
-import hudson.slaves.NodeProperty;
-import hudson.slaves.RetentionStrategy;
 import io.fabric8.kubernetes.api.model.NamespaceBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
-import jenkins.model.JenkinsLocationConfiguration;
 
 /**
  * @author Carlos Sanchez
  */
-public class KubernetesPipelineTest {
+public class KubernetesPipelineTest extends AbstractKubernetesPipelineTest {
 
-    @ClassRule
-    public static BuildWatcher buildWatcher = new BuildWatcher();
-
-    @Rule
-    public RestartableJenkinsRule story = new RestartableJenkinsRule();
-    @Rule
-    public JenkinsRuleNonLocalhost r = new JenkinsRuleNonLocalhost();
-    @Rule
-    public LoggerRule logs = new LoggerRule().record(KubernetesCloud.class, Level.ALL);
+    private static final Logger LOGGER = Logger.getLogger(KubernetesPipelineTest.class.getName());
 
     @Rule
     public TemporaryFolder tmp = new TemporaryFolder();
 
-    private static KubernetesCloud cloud;
-
-    @BeforeClass
-    public static void configureCloud() throws Exception {
-        cloud = setupCloud();
-
-        // Create a busybox template
-        PodTemplate busyboxTemplate = new PodTemplate();
-        busyboxTemplate.setLabel("busybox");
-        ContainerTemplate busybox = new ContainerTemplate("busybox", "busybox", "cat", "");
-        busybox.setTtyEnabled(true);
-        busyboxTemplate.getContainers().add(busybox);
-        cloud.addTemplate(busyboxTemplate);
-    }
-
-    @Before
-    public void addCloudToJenkins() throws Exception {
-        // Slaves running in Kubernetes (minikube) need to connect to this server, so localhost does not work
-        URL url = r.getURL();
-        URL nonLocalhostUrl = new URL(url.getProtocol(), InetAddress.getLocalHost().getHostAddress(), url.getPort(),
-                url.getFile());
-        JenkinsLocationConfiguration.get().setUrl(nonLocalhostUrl.toString());
-
-        r.jenkins.clouds.add(cloud);
-    }
-
     @Test
     public void runInPod() throws Exception {
+        deletePods(cloud.connect(), getLabels(this), false);
+
         WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
         p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runInPod.groovy"), true));
         WorkflowRun b = p.scheduleBuild2(0).waitForStart();
         assertNotNull(b);
+        List<PodTemplate> templates = cloud.getAllTemplates();
+        while (hasPodTemplateWithLabel("mypod",templates)) {
+            LOGGER.log(Level.INFO, "Waiting for template to be created");
+            templates = cloud.getAllTemplates();
+            Thread.sleep(1000);
+        }
+        assertFalse(templates.isEmpty());
+        PodTemplate template = templates.get(0);
+        assertEquals(Integer.MAX_VALUE, template.getInstanceCap());
         r.assertBuildStatusSuccess(r.waitForCompletion(b));
-        r.assertLogContains("PID file contents: ", b);
+        r.assertLogContains("script file contents: ", b);
+        assertFalse("There are pods leftover after test execution, see previous logs",
+                deletePods(cloud.connect(), getLabels(this), true));
+    }
+
+    private boolean hasPodTemplateWithLabel(String label, List<PodTemplate> templates) {
+        return templates != null
+                && templates.stream()
+                .map(PodTemplate::getLabel)
+                .anyMatch(label::equals);
     }
 
     @Test
@@ -137,6 +105,91 @@ public class KubernetesPipelineTest {
         r.assertBuildStatusSuccess(r.waitForCompletion(b));
         r.assertLogContains("outside container", b);
         r.assertLogContains("inside container", b);
+    }
+
+    @Test
+    public void runWithEnvVariables() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "runWithEnvVariables");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithEnvVars.groovy"), true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        assertNotNull(b);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+        assertEnvVars(r, b);
+        r.assertLogContains("OUTSIDE_CONTAINER_BUILD_NUMBER = 1\n", b);
+        r.assertLogContains("INSIDE_CONTAINER_BUILD_NUMBER = 1\n", b);
+        r.assertLogContains("OUTSIDE_CONTAINER_JOB_NAME = runWithEnvVariables\n", b);
+        r.assertLogContains("INSIDE_CONTAINER_JOB_NAME = runWithEnvVariables\n", b);
+
+        // check that we are getting the correct java home
+        r.assertLogContains("INSIDE_JAVA_HOME =\n", b);
+        r.assertLogContains("JNLP_JAVA_HOME = /usr/lib/jvm/java-1.8-openjdk\n", b);
+        r.assertLogContains("JAVA7_HOME = /usr/lib/jvm/java-1.7-openjdk/jre\n", b);
+        r.assertLogContains("JAVA8_HOME = /usr/lib/jvm/java-1.8-openjdk/jre\n", b);
+
+        // check that we are not filtering too much
+        r.assertLogContains("INSIDE_JAVA_HOME_X = java-home-x\n", b);
+        r.assertLogContains("OUTSIDE_JAVA_HOME_X = java-home-x\n", b);
+        r.assertLogContains("JNLP_JAVA_HOME_X = java-home-x\n", b);
+        r.assertLogContains("JAVA7_HOME_X = java-home-x\n", b);
+        r.assertLogContains("JAVA8_HOME_X = java-home-x\n", b);
+    }
+
+    @Test
+    public void runWithEnvVariablesInContext() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithEnvVarsFromContext.groovy"), true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        assertNotNull(b);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+        r.assertLogNotContains("The value of FROM_ENV_DEFINITION is ABC", b);
+        r.assertLogContains("The value of FROM_WITHENV_DEFINITION is DEF", b);
+        r.assertLogContains("The value of WITH_QUOTE is \"WITH_QUOTE", b);
+        r.assertLogContains("The value of AFTER_QUOTE is AFTER_QUOTE\"", b);
+        r.assertLogContains("The value of ESCAPED_QUOTE is \\\"ESCAPED_QUOTE", b);
+        r.assertLogContains("The value of AFTER_ESCAPED_QUOTE is AFTER_ESCAPED_QUOTE\\\"", b);
+        r.assertLogContains("The value of SINGLE_QUOTE is BEFORE'AFTER", b);
+        r.assertLogContains("The value of WITH_NEWLINE is before newline\nafter newline", b);
+        r.assertLogContains("The value of WILL.NOT is ", b);
+    }
+
+    @Test
+    public void runWithExistingEnvVariables() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runInPodWithExistingTemplate.groovy"), true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        assertNotNull(b);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+        assertEnvVars(r, b);
+    }
+
+    private void assertEnvVars(JenkinsRuleNonLocalhost r2, WorkflowRun b) throws Exception {
+        r.assertLogContains("INSIDE_CONTAINER_ENV_VAR = " + CONTAINER_ENV_VAR_VALUE + "\n", b);
+        r.assertLogContains("INSIDE_CONTAINER_ENV_VAR_LEGACY = " + CONTAINER_ENV_VAR_VALUE + "\n", b);
+        r.assertLogContains("INSIDE_CONTAINER_ENV_VAR_FROM_SECRET = " + CONTAINER_ENV_VAR_FROM_SECRET_VALUE + "\n", b);
+        r.assertLogContains("INSIDE_POD_ENV_VAR = " + POD_ENV_VAR_VALUE + "\n", b);
+        r.assertLogContains("INSIDE_POD_ENV_VAR_FROM_SECRET = " + POD_ENV_VAR_FROM_SECRET_VALUE + "\n", b);
+        r.assertLogContains("INSIDE_GLOBAL = " + GLOBAL + "\n", b);
+
+        r.assertLogContains("OUTSIDE_CONTAINER_ENV_VAR =\n", b);
+        r.assertLogContains("OUTSIDE_CONTAINER_ENV_VAR_LEGACY =\n", b);
+        r.assertLogContains("OUTSIDE_CONTAINER_ENV_VAR_FROM_SECRET =\n", b);
+        r.assertLogContains("OUTSIDE_POD_ENV_VAR = " + POD_ENV_VAR_VALUE + "\n", b);
+        r.assertLogContains("OUTSIDE_POD_ENV_VAR_FROM_SECRET = " + POD_ENV_VAR_FROM_SECRET_VALUE + "\n", b);
+        r.assertLogContains("OUTSIDE_GLOBAL = " + GLOBAL + "\n", b);
+
+    }
+
+    @Test
+    public void runWithOverriddenEnvVariables() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithOverriddenEnvVars.groovy"), true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        assertNotNull(b);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+        r.assertLogContains("OUTSIDE_CONTAINER_HOME_ENV_VAR = /home/jenkins\n", b);
+        r.assertLogContains("INSIDE_CONTAINER_HOME_ENV_VAR = /root\n",b);
+        r.assertLogContains("OUTSIDE_CONTAINER_POD_ENV_VAR = " + POD_ENV_VAR_VALUE + "\n", b);
+        r.assertLogContains("INSIDE_CONTAINER_POD_ENV_VAR = " + CONTAINER_ENV_VAR_VALUE + "\n",b);
     }
 
     @Test
@@ -165,44 +218,49 @@ public class KubernetesPipelineTest {
 
     @Test
     public void runWithOverriddenNamespace() throws Exception {
-        String overriddenNamespace = "kubernetes-plugin-overridden-namespace";
+        String overriddenNamespace = testingNamespace + "-overridden-namespace";
         KubernetesClient client = cloud.connect();
         // Run in our own testing namespace
-        client.namespaces().createOrReplace(
-                new NamespaceBuilder().withNewMetadata().withName(overriddenNamespace).endMetadata()
-                        .build());
+        if (client.namespaces().withName(overriddenNamespace).get() == null) {
+            client.namespaces().createOrReplace(
+                    new NamespaceBuilder().withNewMetadata().withName(overriddenNamespace).endMetadata().build());
+        }
 
-        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "job with dir");
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "overriddenNamespace");
         p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithOverriddenNamespace.groovy"), true));
 
         WorkflowRun b = p.scheduleBuild2(0).waitForStart();
-        NamespaceAction namespaceAction = new NamespaceAction(b);
-        namespaceAction.push(overriddenNamespace);
-
         assertNotNull(b);
+        NamespaceAction.push(b, overriddenNamespace);
+
         r.assertBuildStatusSuccess(r.waitForCompletion(b));
         r.assertLogContains(overriddenNamespace, b);
     }
 
     @Test
-    public void runWithOverriddenNamespace2() throws Exception {
-        String overriddenNamespace = "kubernetes-plugin-overridden-namespace";
+    /**
+     * Step namespace should have priority over anything else.
+     */
+    public void runWithStepOverriddenNamespace() throws Exception {
+        String overriddenNamespace = testingNamespace + "-overridden-namespace";
+        String stepNamespace = testingNamespace + "-overridden-namespace2";
         KubernetesClient client = cloud.connect();
         // Run in our own testing namespace
-        client.namespaces().createOrReplace(
-                new NamespaceBuilder().withNewMetadata().withName("testns2").endMetadata()
-                        .build());
+        if (client.namespaces().withName(stepNamespace).get() == null) {
+            client.namespaces().createOrReplace(
+                    new NamespaceBuilder().withNewMetadata().withName(stepNamespace).endMetadata().build());
+        }
 
-        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "job with dir");
-        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithOverriddenNamespace2.groovy"), true));
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "stepOverriddenNamespace");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithStepOverriddenNamespace.groovy")
+                .replace("OVERRIDDEN_NAMESPACE", stepNamespace), true));
 
         WorkflowRun b = p.scheduleBuild2(0).waitForStart();
-        NamespaceAction namespaceAction = new NamespaceAction(b);
-        namespaceAction.push(overriddenNamespace);
-
         assertNotNull(b);
+        NamespaceAction.push(b, overriddenNamespace);
+
         r.assertBuildStatusSuccess(r.waitForCompletion(b));
-        r.assertLogContains("testns2", b);
+        r.assertLogContains(stepNamespace, b);
     }
 
     @Test
@@ -216,56 +274,21 @@ public class KubernetesPipelineTest {
         r.assertLogContains("Still alive", b);
     }
 
-    // @Test
-    public void runInPodWithRestart() throws Exception {
-        story.addStep(new Statement() {
-            @Override
-            public void evaluate() throws Throwable {
-                story.j.jenkins.clouds.add(new KubernetesCloud("test"));
-
-                story.j.jenkins.addNode(new DumbSlave("slave", "dummy", tmp.newFolder("remoteFS").getPath(), "1",
-                        Node.Mode.NORMAL, "", story.j.createComputerLauncher(null), RetentionStrategy.NOOP,
-                        Collections.<NodeProperty<?>>emptyList())); // TODO JENKINS-26398 clumsy
-                WorkflowJob p = story.j.jenkins.createProject(WorkflowJob.class, "p");
-                p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runInPodWithRestart.groovy")
-                        , true));
-                WorkflowRun b = p.scheduleBuild2(0).waitForStart();
-                SemaphoreStep.waitForStart("withDisplayAfterRestart/1", b);
-            }
-        });
-        story.addStep(new Statement() {
-            @SuppressWarnings("SleepWhileInLoop")
-            @Override
-            public void evaluate() throws Throwable {
-                SemaphoreStep.success("withDisplayAfterRestart/1", null);
-                WorkflowJob p = story.j.jenkins.getItemByFullName("p", WorkflowJob.class);
-                assertNotNull(p);
-                WorkflowRun b = p.getBuildByNumber(1);
-                assertNotNull(b);
-                story.j.assertBuildStatusSuccess(story.j.waitForCompletion(b));
-                story.j.assertLogContains("DISPLAY=:", b);
-                r.assertLogContains("xxx", b);
-            }
-        });
-    }
-
-    @Issue("JENKINS-41758")
     @Test
-    public void declarative() throws Exception {
-        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "job with dir");
-        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("declarative.groovy"), true));
+    public void runWithActiveDeadlineSeconds() throws Exception {
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "Deadline");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runWithActiveDeadlineSeconds.groovy")
+                , true));
         WorkflowRun b = p.scheduleBuild2(0).waitForStart();
         assertNotNull(b);
-        r.assertBuildStatusSuccess(r.waitForCompletion(b));
-        r.assertLogContains("Apache Maven 3.3.9", b);
-    }
 
-    private String loadPipelineScript(String name) {
-        try {
-            return new String(IOUtils.toByteArray(getClass().getResourceAsStream(name)));
-        } catch (Throwable t) {
-            throw new RuntimeException("Could not read resource:[" + name + "].");
-        }
+        r.waitForMessage("podTemplate", b);
+
+        PodTemplate deadlineTemplate = cloud.getAllTemplates().stream().filter(x -> x.getLabel() == "deadline").findAny().orElse(null);
+
+        assertNotNull(deadlineTemplate);
+        assertEquals(10, deadlineTemplate.getActiveDeadlineSeconds());
+        r.assertLogNotContains("Hello from container!", b);
     }
 
 }
