@@ -1,4 +1,4 @@
-FROM jenkins/jenkins:lts
+FROM jenkins/jenkins:alpine-lts
 
 ARG VERSION=1.2
 RUN /usr/local/bin/install-plugins.sh kubernetes:${VERSION}
