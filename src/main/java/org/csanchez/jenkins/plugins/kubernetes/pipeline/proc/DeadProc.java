@@ -1,7 +1,7 @@
 /*
  * The MIT License
  *
- * Copyright (c) 2017, CloudBees, Inc.
+ * Copyright (c) 2018, CloudBees, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,47 +22,50 @@
  * THE SOFTWARE.
  */
 
-package org.csanchez.jenkins.plugins.kubernetes;
+package org.csanchez.jenkins.plugins.kubernetes.pipeline.proc;
 
-import java.util.concurrent.Callable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 
-import javax.annotation.CheckForNull;
-import javax.annotation.Nonnull;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
-import hudson.model.Label;
-import hudson.model.Node;
+import hudson.Proc;
 
 /**
- * Callback for Kubernetes cloud provision
- * 
- * @since 0.13
+ * Proc that always returns false for {@link #isAlive()}
  */
-class ProvisioningCallback implements Callable<Node> {
+@Restricted(NoExternalUse.class)
+public class DeadProc extends Proc {
 
-    @Nonnull
-    private final KubernetesCloud cloud;
-    @Nonnull
-    private final PodTemplate t;
-
-    /**
-     * @deprecated Use {@link ProvisioningCallback#ProvisioningCallback(KubernetesCloud, PodTemplate)} instead.
-     */
-    @Deprecated
-    public ProvisioningCallback(@Nonnull KubernetesCloud cloud, @Nonnull PodTemplate t, @CheckForNull Label label) {
-        this(cloud, t);
+    @Override
+    public boolean isAlive() throws IOException, InterruptedException {
+        return false;
     }
 
-    public ProvisioningCallback(@Nonnull KubernetesCloud cloud, @Nonnull PodTemplate t) {
-        this.cloud = cloud;
-        this.t = t;
+    @Override
+    public void kill() throws IOException, InterruptedException {
+
     }
 
-    public Node call() throws Exception {
-        return KubernetesSlave
-                .builder()
-                    .podTemplate(cloud.getUnwrappedTemplate(t))
-                    .cloud(cloud)
-                .build();
+    @Override
+    public int join() throws IOException, InterruptedException {
+        return 1;
     }
 
+    @Override
+    public InputStream getStdout() {
+        return null;
+    }
+
+    @Override
+    public InputStream getStderr() {
+        return null;
+    }
+
+    @Override
+    public OutputStream getStdin() {
+        return null;
+    }
 }

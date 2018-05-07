@@ -34,8 +34,10 @@ Nodes can be defined in a pipeline and then used, however, default execution alw
 
 This will run in jnlp container
 ```groovy
-podTemplate(label: 'mypod') {
-    node('mypod') {
+// this guarantees the node will use this template
+def label = "mypod-${UUID.randomUUID().toString()}"
+podTemplate(label: label) {
+    node(label) {
         stage('Run shell') {
             sh 'echo hello world'
         }
@@ -45,8 +47,9 @@ podTemplate(label: 'mypod') {
 
 This will be container specific
 ```groovy
-podTemplate(label: 'mypod') {
-  node('mypod') {
+def label = "mypod-${UUID.randomUUID().toString()}"
+podTemplate(label: label) {
+  node(label) {
     stage('Run shell') {
       container('mycontainer') {
         sh 'echo hello world'
@@ -71,12 +74,13 @@ Multiple containers can be defined for the agent pod, with shared resources, lik
 The `container` statement allows to execute commands directly into each container. This feature is considered **ALPHA** as there are still some problems with concurrent execution and pipeline resumption
 
 ```groovy
-podTemplate(label: 'mypod', containers: [
+def label = "mypod-${UUID.randomUUID().toString()}"
+podTemplate(label: label, containers: [
     containerTemplate(name: 'maven', image: 'maven:3.3.9-jdk-8-alpine', ttyEnabled: true, command: 'cat'),
     containerTemplate(name: 'golang', image: 'golang:1.8.0', ttyEnabled: true, command: 'cat')
   ]) {
 
-    node('mypod') {
+    node(label) {
         stage('Get a Maven project') {
             git 'https://github.com/jenkinsci/kubernetes-plugin.git'
             container('maven') {
@@ -112,7 +116,8 @@ Either way it provides access to the following fields:
 * **cloud** The name of the cloud as defined in Jenkins settings. Defaults to `kubernetes`
 * **name** The name of the pod.
 * **namespace** The namespace of the pod.
-* **label** The label of the pod.
+* **label** The label of the pod. Set a unique value to avoid conflicts across builds
+* **yaml** [yaml representation of the Pod](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.10/#pod-v1-core), to allow setting any values not supported as fields
 * **containers** The container templates that are use to create the containers of the pod *(see below)*.
 * **serviceAccount** The service account of the pod.
 * **nodeSelector** The node selector of the pod.
@@ -126,6 +131,7 @@ Either way it provides access to the following fields:
 * **inheritFrom** List of one or more pod templates to inherit from *(more details below)*.
 * **slaveConnectTimeout** Timeout in seconds for an agent to be online.
 * **activeDeadlineSeconds** Pod is deleted after this deadline is passed.
+* **idleMinutes** Allows the Pod to remain active for reuse until the configured number of minutes has passed since the last step was executed on it.
 
 The `containerTemplate` is a template of container that will be added to the pod. Again, its configurable via the user interface or via pipeline and allows you to set the following fields:
 
@@ -139,6 +145,38 @@ The `containerTemplate` is a template of container that will be added to the pod
 * **ttyEnabled** Flag to mark that tty should be enabled.
 * **livenessProbe** Parameters to be added to a exec liveness probe in the container (does not suppot httpGet liveness probes)
 * **ports** Expose ports on the container.
+
+#### Using yaml to Define Pod Templates
+
+In order to support any possible value in Kubernetes `Pod` object, we can pass a yaml snippet that will be used as a base
+for the template. If any other properties are set outside of the yaml they will take precedence.
+
+```groovy
+def label = "mypod-${UUID.randomUUID().toString()}"
+podTemplate(label: label, yaml: """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    some-label: some-label-value
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command:
+    - cat
+    tty: true
+"""
+) {
+    node (label) {
+      container('busybox') {
+        sh "hostname"
+      }
+    }
+}
+```
+
+You can use [`readFile` step](https://jenkins.io/doc/pipeline/steps/workflow-basic-steps/#code-readfile-code-read-file-from-workspace) to load the yaml from a file.  It is also accessible from this plugin's configuration panel in the Jenkins console.
 
 #### Liveness Probe Usage
 ```groovy
@@ -245,6 +283,22 @@ There might be cases, where you need to have the agent pod run inside a differen
 For example you may need the agent to run inside an `ephemeral` namespace for the sake of testing.
 For those cases you can explicitly configure a namespace either using the ui or the pipeline.
 
+#### Specifying a different shell command other than /bin/sh
+
+By default, the shell command is /bin/sh. In some case, you would like to use another shell command like /bin/bash.
+
+```groovy
+podTemplate(label: my-label) {
+  node(my-label) {
+    stage('Run specific shell') {
+      container(name:'mycontainer', shell:'/bin/bash') {
+        sh 'echo hello world'
+      }
+    }
+  }
+}
+```
+
 ## Container Configuration
 When configuring a container in a pipeline podTemplate the following options are available:
 
@@ -292,7 +346,69 @@ annotations: [
 
 Declarative Pipeline support requires Jenkins 2.66+
 
-Example at [examples/declarative.groovy](examples/declarative.groovy)
+Declarative agents can be defined from yaml
+
+```groovy
+pipeline {
+  agent {
+    kubernetes {
+      label 'mypod'
+      defaultContainer 'jnlp'
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    some-label: some-label-value
+spec:
+  containers:
+  - name: maven
+    image: maven:alpine
+    command:
+    - cat
+    tty: true
+  - name: busybox
+    image: busybox
+    command:
+    - cat
+    tty: true
+"""
+    }
+  }
+  stages {
+    stage('Run maven') {
+      steps {
+        container('maven') {
+          sh 'mvn -version'
+        }
+        container('busybox') {
+          sh '/bin/busybox'
+        }
+      }
+    }
+  }
+}
+```
+
+Note that it was previously possible to define `containerTemplate` but that has been deprecated in favor of the yaml format.
+
+```groovy
+pipeline {
+  agent {
+    kubernetes {
+      //cloud 'kubernetes'
+      label 'mypod'
+      containerTemplate {
+        name 'maven'
+        image 'maven:3.3.9-jdk-8-alpine'
+        ttyEnabled true
+        command 'cat'
+      }
+    }
+  }
+  stages { ... }
+}
+```
 
 ## Accessing container logs from the pipeline
 
@@ -321,11 +437,13 @@ Also see the online help and [examples/containerLog.groovy](examples/containerLo
 
 Multiple containers can be defined in a pod.
 One of them is automatically created with name `jnlp`, and runs the Jenkins JNLP agent service, with args `${computer.jnlpmac} ${computer.name}`,
-and will be the container acting as Jenkins agent. It can be overridden by defining a container with the same name.
+and will be the container acting as Jenkins agent.
 
 Other containers must run a long running process, so the container does not exit. If the default entrypoint or command
 just runs something and exit then it should be overridden with something like `cat` with `ttyEnabled: true`.
 
+**WARNING**
+If you want to provide your own Docker image for the JNLP slave, you **must** name the container `jnlp` so it overrides the default one. Failing to do so will result in two slaves trying to concurrently connect to the master.
 
 # Over provisioning flags
 
@@ -375,7 +493,22 @@ the last command will output kubernetes cluster configuration including API serv
 
 # Debugging
 
-Configure a new [Jenkins log recorder](https://wiki.jenkins-ci.org/display/JENKINS/Logging) for
+First watch if the Jenkins agent pods are started.
+Make sure you are in the correct cluster and namespace.
+
+    kubectl get -a pods --watch
+
+If they are in a different state than `Running`, use `describe` to get the events
+
+    kubectl describe pods/my-jenkins-agent
+
+If they are `Running`, use `logs` to get the log output
+
+    kubectl logs -f pods/my-jenkins-agent jnlp
+
+If pods are not started or for any other error, check the logs on the master side.
+
+For more detail, configure a new [Jenkins log recorder](https://wiki.jenkins-ci.org/display/JENKINS/Logging) for
 `org.csanchez.jenkins.plugins.kubernetes` at `ALL` level.
 
 To inspect the json messages sent back and forth to the Kubernetes API server you can configure
