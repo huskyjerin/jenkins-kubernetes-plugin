@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
@@ -41,6 +42,7 @@ import com.cloudbees.plugins.credentials.common.StandardCredentials;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
 import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
+import com.ctc.wstx.util.StringUtil;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
@@ -95,6 +97,8 @@ public class KubernetesCloud extends Cloud {
 
     private boolean skipTlsVerify;
     private boolean addMasterProxyEnvVars;
+
+    private boolean capOnlyOnAlivePods;
 
     private String namespace;
     private String jenkinsUrl;
@@ -231,20 +235,27 @@ public class KubernetesCloud extends Cloud {
     	this.addMasterProxyEnvVars = addMasterProxyEnvVars;
     }
 
-    @Nonnull
     public String getNamespace() {
         return namespace;
     }
 
     @DataBoundSetter
-    public void setNamespace(@Nonnull String namespace) {
-        Preconditions.checkArgument(!StringUtils.isBlank(namespace));
-        this.namespace = namespace;
+    public void setNamespace(String namespace) {
+        this.namespace = Util.fixEmpty(namespace);
     }
 
     @CheckForNull
     public String getJenkinsUrl() {
         return jenkinsUrl;
+    }
+
+    @DataBoundSetter
+    public void setCapOnlyOnAlivePods(boolean capOnlyOnAlivePods) {
+        this.capOnlyOnAlivePods = capOnlyOnAlivePods;
+    }
+
+    public boolean isCapOnlyOnAlivePods() {
+        return capOnlyOnAlivePods;
     }
 
     /**
@@ -448,6 +459,22 @@ public class KubernetesCloud extends Cloud {
         labelsMap.putAll(template.getLabelsMap());
         PodList namedList = client.pods().inNamespace(templateNamespace).withLabels(labelsMap).list();
         List<Pod> namedListItems = namedList.getItems();
+
+        if (this.isCapOnlyOnAlivePods()) {
+            slaveListItems = slaveListItems.stream()
+                                           .filter(x -> x.getStatus()
+                                                         .getPhase().toLowerCase()
+                                                                    .matches("(running|pending)"))
+                                           .collect(Collectors.toList());
+        }
+
+        if (template.isCapOnlyOnAlivePods()) {
+            namedListItems = namedListItems.stream()
+                                           .filter(x -> x.getStatus()
+                                                         .getPhase().toLowerCase()
+                                                                    .matches("(running|pending)"))
+                                           .collect(Collectors.toList());
+        }
 
         if (slaveListItems != null && containerCap <= slaveListItems.size()) {
             LOGGER.log(Level.INFO,

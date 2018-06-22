@@ -8,7 +8,7 @@
 
   <groupId>org.csanchez.jenkins.plugins</groupId>
   <artifactId>kubernetes</artifactId>
-  <version>1.6.4-SNAPSHOT</version>
+  <version>1.8.3-SNAPSHOT</version>
   <name>Kubernetes plugin</name>
   <description>Jenkins plugin to run dynamic agents in a Kubernetes cluster</description>
   <packaging>hpi</packaging>
@@ -40,13 +40,13 @@
   <properties>
     <!-- in minikube
     minikube ip | sed -e 's/\([0-9]*\.[0-9]*\.[0-9]*\).*/\1.1/' -->
-    <connectorHost>192.168.64.1</connectorHost>
+    <connectorHost />
     <java.level>8</java.level>
 
     <!-- dependency versions -->
     <jenkins.version>2.32.1</jenkins.version>
 
-    <kubernetes-client.version>3.1.10</kubernetes-client.version>
+    <kubernetes-client.version>3.2.0</kubernetes-client.version>
 
     <!-- jenkins plugins versions -->
     <jenkins-basic-steps.version>2.3</jenkins-basic-steps.version>
@@ -65,6 +65,7 @@
     <jenkins-declarative.version>1.1.2</jenkins-declarative.version>
     <jenkins-script-security.version>1.26</jenkins-script-security.version>
 
+    <no-test-jar>false</no-test-jar>
   </properties>
 
   <dependencies>
@@ -75,12 +76,12 @@
       <exclusions>
         <!-- Jackson logic comes from plugins -->
         <exclusion>
-          <artifactId>com.fasterxml.jackson.core</artifactId>
-          <groupId>jackson-core</groupId>
+          <groupId>com.fasterxml.jackson.core</groupId>
+          <artifactId>jackson-core</artifactId>
         </exclusion>
         <exclusion>
-          <artifactId>com.fasterxml.jackson.core</artifactId>
-          <groupId>jackson-databind</groupId>
+          <groupId>com.fasterxml.jackson.core</groupId>
+          <artifactId>jackson-databind</artifactId>
         </exclusion>
       </exclusions>
     </dependency>
@@ -213,6 +214,12 @@
       <version>2.16.2</version>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>org.jenkins-ci.plugins</groupId>
+      <artifactId>docker-workflow</artifactId>
+      <version>1.15</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <dependencyManagement>
@@ -224,6 +231,11 @@
       </dependency>
 
       <!-- just to fix enforcer RequireUpperBoundDeps -->
+      <dependency>
+        <groupId>org.jenkins-ci.plugins</groupId>
+        <artifactId>credentials-binding</artifactId>
+        <version>1.12</version>
+      </dependency>
       <dependency>
         <groupId>org.jenkins-ci.plugins</groupId>
         <artifactId>structs</artifactId>

@@ -65,6 +65,8 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
 
     private boolean privileged;
 
+    private boolean capOnlyOnAlivePods;
+
     private boolean alwaysPullImage;
 
     private String command;
@@ -417,6 +419,15 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         return getFirstContainer().map(ContainerTemplate::isAlwaysPullImage).orElse(false);
     }
 
+    @DataBoundSetter
+    public void setCapOnlyOnAlivePods(boolean capOnlyOnAlivePods) {
+        this.capOnlyOnAlivePods = capOnlyOnAlivePods;
+    }
+
+    public boolean isCapOnlyOnAlivePods() {
+        return capOnlyOnAlivePods;
+    }
+
     public List<TemplateEnvVar> getEnvVars() {
         if (envVars == null) {
             return Collections.emptyList();
@@ -618,8 +629,8 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
 
     /**
      * Build a Pod object from a PodTemplate
-     * 
-     * @param client 
+     *
+     * @param client
      * @param slave
      */
     public Pod build(KubernetesClient client, KubernetesSlave slave) {
@@ -673,6 +684,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
         public List<? extends Descriptor> getEnvVarsDescriptors() {
             return DescriptorVisibilityFilter.apply(null, Jenkins.getInstance().getDescriptorList(TemplateEnvVar.class));
         }
+        
     }
 
     @Override
@@ -707,7 +719,7 @@ public class PodTemplate extends AbstractDescribableImpl<PodTemplate> implements
                 (annotations == null || annotations.isEmpty() ? "" : ", annotations=" + annotations) +
                 (imagePullSecrets == null || imagePullSecrets.isEmpty() ? "" : ", imagePullSecrets=" + imagePullSecrets) +
                 (nodeProperties == null || nodeProperties.isEmpty() ? "" : ", nodeProperties=" + nodeProperties) +
-                (yaml == null ? "" : ", yaml=" + yaml) +                
+                (yaml == null ? "" : ", yaml=" + yaml) +
                 '}';
     }
 }
